@@ -1,10 +1,4 @@
 import multer from 'multer';
-import {
-  FormatError,
-  InvalidPDFException,
-  PDFParse,
-  PasswordException,
-} from 'pdf-parse';
 
 export const MAX_PDF_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
 export const MIN_PDF_TEXT_LENGTH = 30;
@@ -38,13 +32,6 @@ export function normalizeDocumentText(rawText) {
     .trim();
 }
 
-function getSelectableTextLength(cleanedText) {
-  // pdf-parse v2 appends "-- X of Y --" page separators even on blank/scanned pages
-  return cleanedText
-    .replace(/^--\s*\d+\s+of\s+\d+\s*--$/gm, '')
-    .trim().length;
-}
-
 export async function extractTextFromPdfBuffer(buffer) {
   if (!buffer || buffer.length === 0) {
     const error = new Error('Uploaded PDF file is empty.');
@@ -52,13 +39,15 @@ export async function extractTextFromPdfBuffer(buffer) {
     throw error;
   }
 
-  const parser = new PDFParse({ data: new Uint8Array(buffer) });
+  let pdf = null;
   try {
-    const result = await parser.getText();
-    const cleanedText = normalizeDocumentText(result?.text);
-    const selectableLength = getSelectableTextLength(cleanedText);
+    const { extractText, getDocumentProxy } = await import('unpdf');
+    pdf = await getDocumentProxy(new Uint8Array(buffer));
+    const { totalPages, text } = await extractText(pdf, { mergePages: true });
 
-    if (!cleanedText || selectableLength < MIN_PDF_TEXT_LENGTH) {
+    const cleanedText = normalizeDocumentText(text);
+
+    if (!cleanedText || cleanedText.trim().length < MIN_PDF_TEXT_LENGTH) {
       const error = new Error(
         'This PDF has no selectable text (it appears to be an image-only or scanned document). Please upload a text-based PDF or paste the text directly instead.'
       );
@@ -68,20 +57,24 @@ export async function extractTextFromPdfBuffer(buffer) {
 
     return {
       text: cleanedText,
-      pages: result?.total || result?.pages?.length || 1,
+      pages: totalPages || 1,
     };
   } catch (err) {
     if (err?.status) {
       throw err;
     }
-    if (err instanceof PasswordException) {
+    if (err?.name === 'PasswordException' || /password/i.test(err?.message || '')) {
       const error = new Error(
         'This PDF is password-protected. Please remove the password and try again.'
       );
       error.status = 400;
       throw error;
     }
-    if (err instanceof InvalidPDFException || err instanceof FormatError) {
+    if (
+      err?.name === 'InvalidPDFException' ||
+      err?.name === 'FormatError' ||
+      /invalid pdf/i.test(err?.message || '')
+    ) {
       const error = new Error(
         'Invalid or corrupted PDF file. Please upload a valid PDF document.'
       );
@@ -92,6 +85,8 @@ export async function extractTextFromPdfBuffer(buffer) {
     error.status = 400;
     throw error;
   } finally {
-    await parser.destroy().catch(() => {});
+    if (pdf && typeof pdf.destroy === 'function') {
+      await pdf.destroy().catch(() => {});
+    }
   }
 }

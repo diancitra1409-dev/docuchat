@@ -4,7 +4,7 @@ Chat with PDFs and long notes powered by **Google Gemini (`gemini-3.8-flash`)** 
 
 ## Features
 
-- **PDF Upload & Paste Notes**: Upload PDF files up to **5 MB** (parsed strictly in memory with `multer.memoryStorage()` and `pdf-parse` — zero disk writes) or paste long text/notes directly.
+- **PDF Upload & Paste Notes**: Upload PDF files up to **5 MB** (parsed strictly in memory with `multer.memoryStorage()` and `unpdf` — zero disk writes) or paste long text/notes directly.
 - **Auto Summary & Starter Questions**: Automatically generates a **3-bullet summary** and **3 clickable suggested questions** using Gemini structured JSON output.
 - **Strict Grounded Q&A Chat**: Multi-turn chat interface with a strict system prompt instructing Gemini to answer **only** from the loaded document, cite sections/quotes, and politely state when an answer is not in the document.
 - **1-Click Sample Document**: Includes a **Load Sample Document** button (`Apex Cloud Systems — Remote Work & Employee SOP`) so anyone can test immediately without uploading a file.
