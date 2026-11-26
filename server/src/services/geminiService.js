@@ -1,10 +1,10 @@
 import { GoogleGenAI, Type } from '@google/genai';
 
 export const GEMINI_MODEL = 'gemini-3.8-flash';
-export const RETRY_DELAYS_MS = [700, 1500];
-export const MAX_PROMPT_DOCUMENT_CHARS = 15_000;
-export const SUMMARY_MAX_OUTPUT_TOKENS = 1500;
-export const MAX_OUTPUT_TOKENS = 600;
+export const PRIMARY_TIMEOUT_MS = 4500;
+export const MAX_PROMPT_DOCUMENT_CHARS = 8_000;
+export const SUMMARY_MAX_OUTPUT_TOKENS = 750;
+export const MAX_OUTPUT_TOKENS = 750;
 const MAX_DOCUMENT_CHARS = 400_000;
 const MAX_HISTORY_MESSAGES = 6;
 const NON_TEXT_MODEL_TOKENS = [
@@ -19,10 +19,11 @@ const NON_TEXT_MODEL_TOKENS = [
   'aqa',
 ];
 
-// Module-level cache so once primary model fails with 503/429,
-// subsequent requests skip it and reuse the working flash/flash-lite model.
+// Module-level caches so once primary model times out or returns 503/429,
+// subsequent requests skip it and reuse the working fast model.
 let activeWorkingModel = GEMINI_MODEL;
 let cachedFallbackModels = null;
+const modelsWithoutThinking = new Set();
 
 export function getActiveModel() {
   return activeWorkingModel;
@@ -31,10 +32,7 @@ export function getActiveModel() {
 export function resetActiveModel(model = GEMINI_MODEL) {
   activeWorkingModel = model;
   cachedFallbackModels = null;
-}
-
-function defaultSleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  modelsWithoutThinking.clear();
 }
 
 function tryParseJson(value) {
@@ -84,7 +82,15 @@ export function extractReadableErrorMessage(
   return fallback;
 }
 
+export function isTimeoutError(err) {
+  if (!err) return false;
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
+  return /\btimed?\s*out\b|\baborted\b/i.test(String(err.message || ''));
+}
+
 export function getGeminiErrorStatus(err) {
+  if (isTimeoutError(err)) return 504;
+
   const directStatus = Number(
     err?.status || err?.statusCode || err?.error?.code || err?.code
   );
@@ -101,16 +107,25 @@ export function getGeminiErrorStatus(err) {
   const msg = String(err?.message || '');
   if (/\b503\b|UNAVAILABLE/i.test(msg)) return 503;
   if (/\b429\b|RESOURCE_EXHAUSTED/i.test(msg)) return 429;
+  if (/\b404\b|NOT_FOUND/i.test(msg)) return 404;
   return null;
 }
 
-function isRetryableStatus(status) {
-  return status === 503 || status === 429;
+function shouldFallbackImmediately(err, status) {
+  return isTimeoutError(err) || status === 503 || status === 429 || status === 404;
+}
+
+function isThinkingUnsupportedError(err, status) {
+  if (status && status !== 400) return false;
+  const msg = extractReadableErrorMessage(err, '');
+  return /thinking/i.test(msg);
 }
 
 function normalizeGeminiError(err) {
   const status = getGeminiErrorStatus(err) || 502;
-  const message = extractReadableErrorMessage(err);
+  const message = isTimeoutError(err)
+    ? 'Gemini request timed out. Please try again.'
+    : extractReadableErrorMessage(err);
   const cleanError = new Error(message);
   cleanError.status = status;
   return cleanError;
@@ -161,8 +176,9 @@ function normalizeModelId(name) {
 function rankFallbackModel(modelId) {
   const lower = modelId.toLowerCase();
   let score = 0;
-  if (lower.includes('flash') && !lower.includes('lite')) score += 40;
-  if (lower.includes('flash-lite')) score += 35;
+  // Prefer fast flash-lite and flash models for sub-4s responses
+  if (lower.includes('flash-lite')) score += 45;
+  else if (lower.includes('flash')) score += 40;
   if (!lower.includes('preview') && !lower.includes('exp')) score += 20;
   if (lower.includes('2.5')) score += 15;
   else if (lower.includes('3')) score += 12;
@@ -221,44 +237,42 @@ export async function findFallbackFlashModels(ai, failedModel = GEMINI_MODEL) {
   return ranked.filter((id) => id.toLowerCase() !== normalizedFailed);
 }
 
-async function callModelWithFastRetries({
+async function callGenerateContentSafe({
   ai,
   model,
   contents,
   config,
-  retryDelaysMs,
-  sleep,
+  timeoutMs = null,
 }) {
-  let lastError = null;
-  let lastStatus = null;
+  const buildConfig = (includeThinking) => {
+    const nextConfig = { ...config };
+    if (!includeThinking || modelsWithoutThinking.has(model)) {
+      delete nextConfig.thinkingConfig;
+    }
+    if (timeoutMs) {
+      nextConfig.abortSignal = AbortSignal.timeout(timeoutMs);
+    }
+    return nextConfig;
+  };
 
-  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
-    try {
-      const response = await ai.models.generateContent({
+  try {
+    return await ai.models.generateContent({
+      model,
+      contents,
+      config: buildConfig(true),
+    });
+  } catch (err) {
+    const status = getGeminiErrorStatus(err);
+    if (config?.thinkingConfig && !modelsWithoutThinking.has(model) && isThinkingUnsupportedError(err, status)) {
+      modelsWithoutThinking.add(model);
+      return await ai.models.generateContent({
         model,
         contents,
-        config,
+        config: buildConfig(false),
       });
-      return { response };
-    } catch (err) {
-      lastError = err;
-      lastStatus = getGeminiErrorStatus(err);
-
-      if (!isRetryableStatus(lastStatus) || attempt === retryDelaysMs.length) {
-        break;
-      }
-
-      const delayMs = retryDelaysMs[attempt];
-      console.warn(
-        `[DocuChat] Gemini ${model} returned ${lastStatus} (attempt ${attempt + 1}/${retryDelaysMs.length + 1}). Retrying in ${delayMs}ms...`
-      );
-      await sleep(delayMs);
     }
+    throw err;
   }
-
-  const wrapped = lastError || new Error('Gemini request failed.');
-  wrapped._geminiStatus = lastStatus;
-  throw wrapped;
 }
 
 export async function generateContentWithRetryAndFallback({
@@ -266,122 +280,54 @@ export async function generateContentWithRetryAndFallback({
   model,
   contents,
   config,
-  retryDelaysMs = RETRY_DELAYS_MS,
-  sleep = defaultSleep,
+  primaryTimeoutMs = PRIMARY_TIMEOUT_MS,
 }) {
   const targetModel = model || activeWorkingModel;
-  let lastError = null;
-  let lastStatus = null;
+  const timeoutForTarget = targetModel === GEMINI_MODEL ? primaryTimeoutMs : null;
 
-  // When targetModel is the primary gemini-3.8-flash and hits 503/429,
-  // immediately switch to an available flash/flash-lite fallback and cache it.
-  if (targetModel === GEMINI_MODEL) {
-    try {
-      const response = await ai.models.generateContent({
-        model: targetModel,
-        contents,
-        config,
-      });
-      return { response, modelUsed: targetModel };
-    } catch (err) {
-      lastError = err;
-      lastStatus = getGeminiErrorStatus(err);
-
-      if (!isRetryableStatus(lastStatus)) {
-        throw normalizeGeminiError(err);
-      }
-
-      let fallbackModels = [];
-      try {
-        fallbackModels = await findFallbackFlashModels(ai, targetModel);
-      } catch (listErr) {
-        console.warn(
-          '[DocuChat] Failed to list fallback models:',
-          extractReadableErrorMessage(listErr)
-        );
-      }
-
-      if (fallbackModels.length > 0) {
-        const primaryStatus = lastStatus;
-        for (const fallbackModel of fallbackModels.slice(0, 3)) {
-          try {
-            console.warn(
-              `[DocuChat] ${targetModel} returned ${primaryStatus}; switching & caching active model -> ${fallbackModel}`
-            );
-            const { response } = await callModelWithFastRetries({
-              ai,
-              model: fallbackModel,
-              contents,
-              config,
-              retryDelaysMs,
-              sleep,
-            });
-            activeWorkingModel = fallbackModel;
-            return { response, modelUsed: fallbackModel };
-          } catch (fallbackErr) {
-            lastError = fallbackErr;
-            lastStatus = fallbackErr?._geminiStatus || getGeminiErrorStatus(fallbackErr);
-          }
-        }
-        throw normalizeGeminiError(lastError);
-      }
-
-      // No fallback models found; do fast retries on primary model
-      for (let attempt = 0; attempt < retryDelaysMs.length; attempt += 1) {
-        await sleep(retryDelaysMs[attempt]);
-        try {
-          const response = await ai.models.generateContent({
-            model: targetModel,
-            contents,
-            config,
-          });
-          return { response, modelUsed: targetModel };
-        } catch (retryErr) {
-          lastError = retryErr;
-          lastStatus = getGeminiErrorStatus(retryErr);
-          if (!isRetryableStatus(lastStatus)) break;
-        }
-      }
-
-      throw normalizeGeminiError(lastError);
-    }
-  }
-
-  // Already using a cached fallback model: retry up to 2 times (700ms, 1500ms)
   try {
-    const { response } = await callModelWithFastRetries({
+    const response = await callGenerateContentSafe({
       ai,
       model: targetModel,
       contents,
       config,
-      retryDelaysMs,
-      sleep,
+      timeoutMs: timeoutForTarget,
     });
     return { response, modelUsed: targetModel };
   } catch (err) {
-    lastError = err;
-    lastStatus = err?._geminiStatus || getGeminiErrorStatus(err);
+    let lastError = err;
+    const initialStatus = getGeminiErrorStatus(err);
 
-    if (isRetryableStatus(lastStatus)) {
-      let fallbackModels = [];
+    if (!shouldFallbackImmediately(err, initialStatus)) {
+      throw normalizeGeminiError(err);
+    }
+
+    const reason = isTimeoutError(err) ? `timeout (${primaryTimeoutMs}ms)` : initialStatus;
+    let fallbackModels = [];
+    try {
+      fallbackModels = await findFallbackFlashModels(ai, targetModel);
+    } catch (listErr) {
+      console.warn(
+        '[DocuChat] Failed to list fallback models:',
+        extractReadableErrorMessage(listErr)
+      );
+    }
+
+    for (const fallbackModel of fallbackModels.slice(0, 3)) {
       try {
-        fallbackModels = await findFallbackFlashModels(ai, targetModel);
-      } catch {
-        fallbackModels = [];
-      }
-
-      for (const fallbackModel of fallbackModels.slice(0, 2)) {
-        try {
-          const response = await ai.models.generateContent({
-            model: fallbackModel,
-            contents,
-            config,
-          });
-          activeWorkingModel = fallbackModel;
-          return { response, modelUsed: fallbackModel };
-        } catch (fallbackErr) {
-          lastError = fallbackErr;
-        }
+        console.warn(
+          `[DocuChat] ${targetModel} hit ${reason}; immediately switching & caching active model -> ${fallbackModel}`
+        );
+        const response = await callGenerateContentSafe({
+          ai,
+          model: fallbackModel,
+          contents,
+          config,
+        });
+        activeWorkingModel = fallbackModel;
+        return { response, modelUsed: fallbackModel };
+      } catch (fallbackErr) {
+        lastError = fallbackErr;
       }
     }
 
@@ -454,7 +400,7 @@ export function buildFallbackInsights(documentText, title = 'Untitled Document')
 
   const fallbackBullets = [
     sentences[0] || `Loaded document "${title}" (${cleaned.length.toLocaleString()} characters) for interactive analysis.`,
-    sentences[1] || `Includes full extracted text from "${title}" ready for grounded citation-backed Q&A.`,
+    sentences[1] || `Includes extracted text from "${title}" ready for grounded citation-backed Q&A.`,
     sentences[2] || `Use the chat panel to ask about specific sections, findings, definitions, or quotes from "${title}".`,
   ];
 
@@ -488,13 +434,13 @@ ${promptText}
     config: {
       temperature: 0.2,
       maxOutputTokens: SUMMARY_MAX_OUTPUT_TOKENS,
+      thinkingConfig: { thinkingBudget: 0 },
       responseMimeType: 'application/json',
       responseSchema: INSIGHTS_SCHEMA,
       systemInstruction:
         'You are DocuChat. Be concise and direct. Base the 3 summary bullets and 3 questions strictly on the provided document.',
     },
-    retryDelaysMs: options.retryDelaysMs,
-    sleep: options.sleep,
+    primaryTimeoutMs: options.primaryTimeoutMs,
   });
 
   const parsed = parseStructuredInsightsJson(response?.text);
@@ -592,10 +538,10 @@ ${promptText}
     config: {
       temperature: 0.2,
       maxOutputTokens: MAX_OUTPUT_TOKENS,
+      thinkingConfig: { thinkingBudget: 0 },
       systemInstruction,
     },
-    retryDelaysMs: options.retryDelaysMs,
-    sleep: options.sleep,
+    primaryTimeoutMs: options.primaryTimeoutMs,
   });
 
   const answer = response.text?.trim();

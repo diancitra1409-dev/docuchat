@@ -2,6 +2,7 @@ import multer from 'multer';
 
 export const MAX_PDF_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
 export const MIN_PDF_TEXT_LENGTH = 30;
+export const MAX_PDF_TEXT_CHARS = 8_000;
 
 const storage = multer.memoryStorage();
 
@@ -41,11 +42,40 @@ export async function extractTextFromPdfBuffer(buffer) {
 
   let pdf = null;
   try {
-    const { extractText, getDocumentProxy } = await import('unpdf');
+    const { getDocumentProxy } = await import('unpdf');
     pdf = await getDocumentProxy(new Uint8Array(buffer));
-    const { totalPages, text } = await extractText(pdf, { mergePages: true });
 
-    const cleanedText = normalizeDocumentText(text);
+    const totalPages = pdf.numPages || 1;
+    const pageTexts = [];
+    let collectedChars = 0;
+
+    // Stop reading pages as soon as we have 8,000 characters so large PDFs finish in milliseconds.
+    for (let pageNumber = 1; pageNumber <= totalPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      try {
+        const textContent = await page.getTextContent();
+        const rawPageText = textContent.items
+          .filter((item) => item.str != null)
+          .map((item) => item.str + (item.hasEOL ? '\n' : ''))
+          .join('');
+        const normalizedPage = normalizeDocumentText(rawPageText);
+        if (normalizedPage) {
+          pageTexts.push(normalizedPage);
+          collectedChars += normalizedPage.length + 2;
+        }
+      } finally {
+        page.cleanup?.();
+      }
+
+      if (collectedChars >= MAX_PDF_TEXT_CHARS) {
+        break;
+      }
+    }
+
+    let cleanedText = normalizeDocumentText(pageTexts.join('\n\n'));
+    if (cleanedText.length > MAX_PDF_TEXT_CHARS) {
+      cleanedText = cleanedText.slice(0, MAX_PDF_TEXT_CHARS).trimEnd();
+    }
 
     if (!cleanedText || cleanedText.trim().length < MIN_PDF_TEXT_LENGTH) {
       const error = new Error(
@@ -57,7 +87,8 @@ export async function extractTextFromPdfBuffer(buffer) {
 
     return {
       text: cleanedText,
-      pages: totalPages || 1,
+      pages: totalPages,
+      parsedPages: pageTexts.length,
     };
   } catch (err) {
     if (err?.status) {
