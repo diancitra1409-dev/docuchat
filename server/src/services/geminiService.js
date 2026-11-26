@@ -1,13 +1,18 @@
 import { GoogleGenAI, Type } from '@google/genai';
 
 export const GEMINI_MODEL = 'gemini-3.8-flash';
-export const PRIMARY_TIMEOUT_MS = 4500;
+export const MODEL_TIMEOUT_MS = 7500;
 export const MAX_PROMPT_DOCUMENT_CHARS = 8_000;
 export const SUMMARY_MAX_OUTPUT_TOKENS = 750;
 export const MAX_OUTPUT_TOKENS = 750;
 const MAX_DOCUMENT_CHARS = 400_000;
 const MAX_HISTORY_MESSAGES = 6;
-const NON_TEXT_MODEL_TOKENS = [
+
+const EXCLUDED_MODEL_TOKENS = [
+  'gemma',
+  'embedding',
+  'imagen',
+  'veo',
   'tts',
   'image',
   'audio',
@@ -15,24 +20,20 @@ const NON_TEXT_MODEL_TOKENS = [
   'robotics',
   'computer-use',
   'customtools',
-  'embedding',
   'aqa',
 ];
 
-// Module-level caches so once primary model times out or returns 503/429,
-// subsequent requests skip it and reuse the working fast model.
-let activeWorkingModel = GEMINI_MODEL;
-let cachedFallbackModels = null;
-const modelsWithoutThinking = new Set();
+// Module-level caches for live model list and the last working model
+let activeWorkingModel = null;
+let cachedAvailableModels = null;
 
 export function getActiveModel() {
-  return activeWorkingModel;
+  return activeWorkingModel || GEMINI_MODEL;
 }
 
-export function resetActiveModel(model = GEMINI_MODEL) {
+export function resetActiveModel(model = null) {
   activeWorkingModel = model;
-  cachedFallbackModels = null;
-  modelsWithoutThinking.clear();
+  cachedAvailableModels = null;
 }
 
 function tryParseJson(value) {
@@ -111,14 +112,8 @@ export function getGeminiErrorStatus(err) {
   return null;
 }
 
-function shouldFallbackImmediately(err, status) {
-  return isTimeoutError(err) || status === 503 || status === 429 || status === 404;
-}
-
-function isThinkingUnsupportedError(err, status) {
-  if (status && status !== 400) return false;
-  const msg = extractReadableErrorMessage(err, '');
-  return /thinking/i.test(msg);
+function shouldRotateModel(err, status) {
+  return isTimeoutError(err) || status === 429 || status === 503 || status === 404;
 }
 
 function normalizeGeminiError(err) {
@@ -173,106 +168,82 @@ function normalizeModelId(name) {
     .replace(/^models\//, '');
 }
 
-function rankFallbackModel(modelId) {
+function extractVersionScore(lower) {
+  const match = lower.match(/gemini-(\d+)(?:\.(\d+))?/);
+  if (!match) return 0;
+  const major = Number(match[1]) || 0;
+  const minor = Number(match[2]) || 0;
+  return major * 10 + minor;
+}
+
+function rankGeminiModel(modelId) {
   const lower = modelId.toLowerCase();
   let score = 0;
-  // Prefer fast flash-lite and flash models for sub-4s responses
-  if (lower.includes('flash-lite')) score += 45;
-  else if (lower.includes('flash')) score += 40;
-  if (!lower.includes('preview') && !lower.includes('exp')) score += 20;
-  if (lower.includes('2.5')) score += 15;
-  else if (lower.includes('3')) score += 12;
-  else if (lower.includes('2.0')) score += 10;
+
+  // Put flash-lite and flash models first
+  if (lower.includes('flash-lite')) score += 1000;
+  else if (lower.includes('flash')) score += 900;
+  else if (lower.includes('pro')) score += 200;
+
+  // Prefer stable releases over preview/experimental
+  if (!lower.includes('preview') && !lower.includes('exp') && !lower.includes('latest')) {
+    score += 100;
+  }
+
+  // Prefer newer Gemini versions (e.g., 3.5 > 3.1 > 2.5 > 2.0)
+  score += extractVersionScore(lower);
+
   return score;
 }
 
-export async function findFallbackFlashModels(ai, failedModel = GEMINI_MODEL) {
-  if (Array.isArray(cachedFallbackModels) && cachedFallbackModels.length > 0) {
-    return cachedFallbackModels.filter(
-      (id) => id.toLowerCase() !== normalizeModelId(failedModel).toLowerCase()
-    );
+export async function getAvailableGeminiModels(ai) {
+  if (Array.isArray(cachedAvailableModels) && cachedAvailableModels.length > 0) {
+    return cachedAvailableModels;
   }
 
-  const models = [];
-  const listResult = await ai.models.list({ config: { pageSize: 100 } });
-
-  if (Array.isArray(listResult)) {
-    models.push(...listResult);
-  } else if (listResult && typeof listResult[Symbol.asyncIterator] === 'function') {
-    for await (const model of listResult) {
-      models.push(model);
+  const rawModels = [];
+  if (typeof ai?.models?.list === 'function') {
+    const listResult = await ai.models.list({ config: { pageSize: 100 } });
+    if (Array.isArray(listResult)) {
+      rawModels.push(...listResult);
+    } else if (listResult && typeof listResult[Symbol.asyncIterator] === 'function') {
+      for await (const model of listResult) {
+        rawModels.push(model);
+      }
+    } else if (Array.isArray(listResult?.page)) {
+      rawModels.push(...listResult.page);
+    } else if (Array.isArray(listResult?.models)) {
+      rawModels.push(...listResult.models);
     }
-  } else if (Array.isArray(listResult?.page)) {
-    models.push(...listResult.page);
-  } else if (Array.isArray(listResult?.models)) {
-    models.push(...listResult.models);
   }
 
-  const normalizedPrimary = normalizeModelId(GEMINI_MODEL).toLowerCase();
-  const normalizedFailed = normalizeModelId(failedModel).toLowerCase();
   const seen = new Set();
-
-  const ranked = models
+  const filtered = rawModels
     .filter((m) => {
       const id = normalizeModelId(m?.name);
       if (!id) return false;
       const lower = id.toLowerCase();
-      if (lower === normalizedPrimary || seen.has(lower)) return false;
+      if (!lower.startsWith('gemini-') || seen.has(lower)) return false;
+
+      if (EXCLUDED_MODEL_TOKENS.some((token) => lower.includes(token))) {
+        return false;
+      }
 
       const supportsGenerate =
         !Array.isArray(m?.supportedActions) ||
         m.supportedActions.includes('generateContent');
       if (!supportsGenerate) return false;
 
-      if (!lower.includes('gemini') || !lower.includes('flash')) return false;
-      if (NON_TEXT_MODEL_TOKENS.some((token) => lower.includes(token))) return false;
-
       seen.add(lower);
       return true;
     })
     .map((m) => normalizeModelId(m.name))
-    .sort((a, b) => rankFallbackModel(b) - rankFallbackModel(a));
+    .sort((a, b) => rankGeminiModel(b) - rankGeminiModel(a));
 
-  cachedFallbackModels = ranked;
-  return ranked.filter((id) => id.toLowerCase() !== normalizedFailed);
-}
-
-async function callGenerateContentSafe({
-  ai,
-  model,
-  contents,
-  config,
-  timeoutMs = null,
-}) {
-  const buildConfig = (includeThinking) => {
-    const nextConfig = { ...config };
-    if (!includeThinking || modelsWithoutThinking.has(model)) {
-      delete nextConfig.thinkingConfig;
-    }
-    if (timeoutMs) {
-      nextConfig.abortSignal = AbortSignal.timeout(timeoutMs);
-    }
-    return nextConfig;
-  };
-
-  try {
-    return await ai.models.generateContent({
-      model,
-      contents,
-      config: buildConfig(true),
-    });
-  } catch (err) {
-    const status = getGeminiErrorStatus(err);
-    if (config?.thinkingConfig && !modelsWithoutThinking.has(model) && isThinkingUnsupportedError(err, status)) {
-      modelsWithoutThinking.add(model);
-      return await ai.models.generateContent({
-        model,
-        contents,
-        config: buildConfig(false),
-      });
-    }
-    throw err;
+  if (filtered.length > 0) {
+    cachedAvailableModels = filtered;
   }
+  return filtered;
 }
 
 export async function generateContentWithRetryAndFallback({
@@ -280,59 +251,75 @@ export async function generateContentWithRetryAndFallback({
   model,
   contents,
   config,
-  primaryTimeoutMs = PRIMARY_TIMEOUT_MS,
+  timeoutMs = MODEL_TIMEOUT_MS,
 }) {
-  const targetModel = model || activeWorkingModel;
-  const timeoutForTarget = targetModel === GEMINI_MODEL ? primaryTimeoutMs : null;
-
-  try {
-    const response = await callGenerateContentSafe({
-      ai,
-      model: targetModel,
-      contents,
-      config,
-      timeoutMs: timeoutForTarget,
-    });
-    return { response, modelUsed: targetModel };
-  } catch (err) {
-    let lastError = err;
-    const initialStatus = getGeminiErrorStatus(err);
-
-    if (!shouldFallbackImmediately(err, initialStatus)) {
-      throw normalizeGeminiError(err);
-    }
-
-    const reason = isTimeoutError(err) ? `timeout (${primaryTimeoutMs}ms)` : initialStatus;
-    let fallbackModels = [];
+  let availableModels = [];
+  if (!model) {
     try {
-      fallbackModels = await findFallbackFlashModels(ai, targetModel);
+      availableModels = await getAvailableGeminiModels(ai);
     } catch (listErr) {
       console.warn(
-        '[DocuChat] Failed to list fallback models:',
+        '[DocuChat] Failed to list available Gemini models:',
         extractReadableErrorMessage(listErr)
       );
     }
-
-    for (const fallbackModel of fallbackModels.slice(0, 3)) {
-      try {
-        console.warn(
-          `[DocuChat] ${targetModel} hit ${reason}; immediately switching & caching active model -> ${fallbackModel}`
-        );
-        const response = await callGenerateContentSafe({
-          ai,
-          model: fallbackModel,
-          contents,
-          config,
-        });
-        activeWorkingModel = fallbackModel;
-        return { response, modelUsed: fallbackModel };
-      } catch (fallbackErr) {
-        lastError = fallbackErr;
-      }
-    }
-
-    throw normalizeGeminiError(lastError);
   }
+
+  const candidateOrder = [];
+  const addCandidate = (id) => {
+    if (id && !candidateOrder.includes(id)) {
+      candidateOrder.push(id);
+    }
+  };
+
+  if (model) {
+    addCandidate(model);
+  } else {
+    if (activeWorkingModel) {
+      addCandidate(activeWorkingModel);
+    }
+    for (const id of availableModels) {
+      addCandidate(id);
+    }
+    if (candidateOrder.length === 0) {
+      addCandidate(GEMINI_MODEL);
+    }
+  }
+
+  let lastError = null;
+
+  for (const candidateModel of candidateOrder) {
+    try {
+      const response = await ai.models.generateContent({
+        model: candidateModel,
+        contents,
+        config: {
+          ...config,
+          abortSignal: AbortSignal.timeout(timeoutMs),
+        },
+      });
+      activeWorkingModel = candidateModel;
+      return { response, modelUsed: candidateModel };
+    } catch (err) {
+      lastError = err;
+      const status = getGeminiErrorStatus(err);
+
+      if (!shouldRotateModel(err, status)) {
+        throw normalizeGeminiError(err);
+      }
+
+      if (status === 404 && Array.isArray(cachedAvailableModels)) {
+        cachedAvailableModels = cachedAvailableModels.filter((id) => id !== candidateModel);
+      }
+
+      const reason = isTimeoutError(err) ? `timeout (${timeoutMs}ms)` : status;
+      console.warn(
+        `[DocuChat] Model ${candidateModel} failed with ${reason}; rotating to next available Gemini model...`
+      );
+    }
+  }
+
+  throw normalizeGeminiError(lastError);
 }
 
 const INSIGHTS_SCHEMA = {
@@ -434,13 +421,12 @@ ${promptText}
     config: {
       temperature: 0.2,
       maxOutputTokens: SUMMARY_MAX_OUTPUT_TOKENS,
-      thinkingConfig: { thinkingBudget: 0 },
       responseMimeType: 'application/json',
       responseSchema: INSIGHTS_SCHEMA,
       systemInstruction:
         'You are DocuChat. Be concise and direct. Base the 3 summary bullets and 3 questions strictly on the provided document.',
     },
-    primaryTimeoutMs: options.primaryTimeoutMs,
+    timeoutMs: options.timeoutMs,
   });
 
   const parsed = parseStructuredInsightsJson(response?.text);
@@ -538,10 +524,9 @@ ${promptText}
     config: {
       temperature: 0.2,
       maxOutputTokens: MAX_OUTPUT_TOKENS,
-      thinkingConfig: { thinkingBudget: 0 },
       systemInstruction,
     },
-    primaryTimeoutMs: options.primaryTimeoutMs,
+    timeoutMs: options.timeoutMs,
   });
 
   const answer = response.text?.trim();
